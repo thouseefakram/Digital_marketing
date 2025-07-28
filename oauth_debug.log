@@ -1,0 +1,5 @@
+2025-07-18 16:44:47,268 - main - INFO - Starting LinkedIn OAuth service
+2025-07-18 16:44:47,268 - main - INFO - Configured redirect URI: http://localhost:8000/api/linkedin/callback
+2025-07-18 16:44:47,268 - main - INFO - Using client ID: 86ch...
+2025-07-18 16:44:58,601 - main - INFO - Initiating OAuth flow from 127.0.0.1
+2025-07-18 16:44:58,602 - main - INFO - Redirecting browser client
