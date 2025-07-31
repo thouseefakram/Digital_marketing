@@ -1,90 +1,235 @@
 import os
-from urllib.parse import urlencode
+import sys
+import hashlib
+import base64
+import json
+import logging
+import traceback
+from datetime import datetime
+from urllib.parse import urlparse
 from django.http import JsonResponse
 from django.conf import settings
-from google.oauth2.credentials import Credentials
+from django.contrib.sessions.backends.db import SessionStore
 from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-# Google OAuth2 configuration
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-GOOGLE_SCOPES = [
-    'https://www.googleapis.com/auth/adwords',
-    'https://www.googleapis.com/auth/youtube.readonly',
-    'https://www.googleapis.com/auth/yt-analytics.readonly',
-    'https://www.googleapis.com/auth/userinfo.profile',
-    'https://www.googleapis.com/auth/userinfo.email',
-    'openid'
-]
+# Google OAuth Configuration
+GOOGLE_CONFIG = {
+    "web": {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI")],
+        "scopes": [
+            'https://www.googleapis.com/auth/adwords',
+            'https://www.googleapis.com/auth/youtube.readonly',
+            'https://www.googleapis.com/auth/yt-analytics.readonly',
+            'https://www.googleapis.com/auth/userinfo.profile',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'openid'
+        ]
+    }
+}
 
 def google_login_url(request):
-    flow = Flow.from_client_config(
-        client_config={
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://accounts.google.com/o/oauth2/token",
-                "redirect_uris": [GOOGLE_REDIRECT_URI]
-            }
-        },
-        scopes=GOOGLE_SCOPES
-    )
-    
-    authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true',
-        prompt='consent'
-    )
-    
-    request.session['google_oauth_state'] = state
-    return JsonResponse({'login_url': authorization_url})
+    """Generate Google OAuth URL with comprehensive error handling"""
+    response_data = {
+        'status': 'error',
+        'message': 'Initialization failed',
+        'debug': {
+            'session_exists': bool(request.session.session_key),
+            'client_id_configured': bool(os.getenv("GOOGLE_CLIENT_ID")),
+            'redirect_uri': os.getenv("GOOGLE_REDIRECT_URI")
+        }
+    }
+
+    try:
+        # Verify critical configuration
+        if not os.getenv("GOOGLE_CLIENT_ID"):
+            raise ValueError("GOOGLE_CLIENT_ID not configured")
+        if not os.getenv("GOOGLE_REDIRECT_URI"):
+            raise ValueError("GOOGLE_REDIRECT_URI not configured")
+
+        # Ensure session exists
+        if not request.session.session_key:
+            request.session.create()
+            logger.info(f"Created new session: {request.session.session_key}")
+
+        # Generate state with metadata
+        state_data = {
+            'token': hashlib.sha256(os.urandom(1024)).hexdigest(),
+            'session_key': request.session.session_key,
+            'timestamp': datetime.now().isoformat(),
+            'ip': request.META.get('REMOTE_ADDR')
+        }
+        state = base64.urlsafe_b64encode(
+            json.dumps(state_data).encode()
+        ).decode().rstrip('=')
+
+        # Configure flow
+        flow = Flow.from_client_config(
+            client_config={
+                "web": {
+                    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                    "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI")],
+                }
+            },
+            scopes=GOOGLE_CONFIG['web']['scopes'],
+            redirect_uri=os.getenv("GOOGLE_REDIRECT_URI"),
+            state=state
+        )
+
+        auth_url, _ = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+
+        # Store state in session for validation
+        request.session['oauth_state'] = state_data
+        request.session.save()
+
+        response = JsonResponse({
+            'status': 'success',
+            'auth_url': auth_url,
+            'session_key': request.session.session_key
+        })
+
+        # Set tracking cookie
+        response.set_cookie(
+            'oauth_flow',
+            f'google:{request.session.session_key}',
+            max_age=300,
+            httponly=True,
+            samesite='Lax'
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f"Login URL generation failed: {str(e)}\n{traceback.format_exc()}")
+        response_data.update({
+            'message': str(e),
+            'error_type': type(e).__name__,
+            'traceback': traceback.format_exc().splitlines()[-1]
+        })
+        return JsonResponse(response_data, status=500)
 
 def google_callback(request):
-    state = request.session.get('google_oauth_state')
-    if not state or state != request.GET.get('state'):
-        return JsonResponse({'error': 'Invalid state parameter'}, status=400)
-    
-    flow = Flow.from_client_config(
-        client_config={
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://accounts.google.com/o/oauth2/token",
-                "redirect_uris": [GOOGLE_REDIRECT_URI]
-            }
-        },
-        scopes=GOOGLE_SCOPES,
-        state=state
-    )
-    
-    flow.fetch_token(authorization_response=request.build_absolute_uri())
-    
-    credentials = flow.credentials
-    request.session['google_credentials'] = {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
+    """Handle OAuth callback with multiple fallback mechanisms"""
+    response_data = {
+        'status': 'error',
+        'debug': {
+            'params': dict(request.GET),
+            'headers': {k: v for k, v in request.headers.items() if k.lower() not in ['authorization', 'cookie']},
+            'session_keys': list(request.session.keys()) if request.session.session_key else None
+        }
     }
-    
-    return JsonResponse({
-        'access_token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'expires_at': credentials.expiry.isoformat() if credentials.expiry else None
-    })
 
+    try:
+        # Essential parameter checks
+        if 'code' not in request.GET:
+            raise ValueError("Missing authorization code")
+        
+        state = request.GET.get('state')
+        if not state:
+            raise ValueError("Missing state parameter")
+
+        # Attempt to load state from multiple sources
+        state_data = None
+        sources_tried = []
+        
+        # 1. Try from session first
+        if 'oauth_state' in request.session:
+            state_data = request.session['oauth_state']
+            sources_tried.append('session')
+        
+        # 2. Try decoding from state parameter if session fails
+        if not state_data:
+            try:
+                padding = len(state) % 4
+                decoded = base64.urlsafe_b64decode(state + ('=' * padding)).decode()
+                state_data = json.loads(decoded)
+                sources_tried.append('url_encoded')
+            except (ValueError, json.JSONDecodeError):
+                pass
+        
+        # 3. Try cookie-based session recovery
+        if not state_data and 'oauth_flow' in request.COOKIES:
+            try:
+                _, session_key = request.COOKIES['oauth_flow'].split(':')
+                temp_session = SessionStore(session_key=session_key)
+                if 'oauth_state' in temp_session:
+                    state_data = temp_session['oauth_state']
+                    sources_tried.append('cookie_recovery')
+            except Exception as e:
+                logger.warning(f"Cookie recovery failed: {str(e)}")
+
+        if not state_data:
+            raise ValueError(
+                f"Could not recover state from any source. Tried: {sources_tried or 'none'}"
+            )
+
+        # Validate state contents
+        required_fields = {'token', 'session_key', 'timestamp'}
+        if not all(field in state_data for field in required_fields):
+            raise ValueError(f"Invalid state format. Missing fields: {required_fields - set(state_data.keys())}")
+
+        # Initialize flow
+        flow = Flow.from_client_config(
+            client_config={
+                "web": {
+                    "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                    "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI")],
+                }
+            },
+            scopes=GOOGLE_CONFIG['web']['scopes'],
+            redirect_uri=os.getenv("GOOGLE_REDIRECT_URI"),
+            state=state
+        )
+        
+        # Exchange code for tokens
+        flow.fetch_token(authorization_response=request.build_absolute_uri())
+
+        # Store credentials
+        request.session['google_credentials'] = {
+            'token': flow.credentials.token,
+            'refresh_token': flow.credentials.refresh_token,
+            'token_uri': flow.credentials.token_uri,
+            'client_id': flow.credentials.client_id,
+            'client_secret': os.getenv("GOOGLE_CLIENT_SECRET"),
+            'scopes': flow.credentials.scopes,
+            'expiry': flow.credentials.expiry.isoformat() if flow.credentials.expiry else None 
+        }
+        request.session.modified = True
+
+        return JsonResponse({
+            'status': 'success',
+            'message': 'Authentication successful',
+            'session_key': request.session.session_key,
+            'state_source': sources_tried[0] if sources_tried else 'unknown'
+        })
+
+    except Exception as e:
+        logger.error(f"Callback failed: {str(e)}\n{traceback.format_exc()}")
+        response_data.update({
+            'message': str(e),
+            'error_type': type(e).__name__,
+            'state_sources_tried': sources_tried,
+            'state_data_received': state_data
+        })
+        return JsonResponse(response_data, status=400)
+    
 def get_google_credentials(request):
     """Helper function to get credentials from session"""
     creds_data = request.session.get('google_credentials')

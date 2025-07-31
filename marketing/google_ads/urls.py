@@ -12,3 +12,5 @@ urlpatterns = [
     path('youtube_channels', views.get_youtube_channels),
     path('youtube_insights', views.get_youtube_insights),
 ]
+
+
